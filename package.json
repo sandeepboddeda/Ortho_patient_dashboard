@@ -1,0 +1,10 @@
+{
+  "name": "ortho-ward-board",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Ortho ward board — runs locally (file storage) or on your Google Sheet",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": { "googleapis": "^144.0.0" }
+}
