@@ -1,295 +1,47 @@
-// Ortho Ward Board — standalone server
-//
-//   node server.js
-//
-// Storage:
-//   • Google Sheet mode  — if credentials.json (Desktop OAuth client) or google-key.json
-//                          (service-account key) is next to this file, patients are read from
-//                          and saved to your Google Sheet. With credentials.json you sign in once
-//                          in the browser and the login is kept in token.json.
-//   • Local mode         — otherwise, patients are saved in data/sheet.json on this computer.
-//
-// Settings live in config.json (environment variables override them):
-//   port / PORT, password / BOARD_PASSWORD, sheetId / SHEET_ID, googleKeyFile / GOOGLE_KEY_FILE
-//   On hosts like Hugging Face you can instead put the whole key JSON in GOOGLE_SERVICE_ACCOUNT_JSON.
+// Ortho Ward Board — local runner.
+// On Vercel the files in api/ run on their own; this file is only for running
+// the same board on your own computer:   npm install   then   npm start
+// It reads the same .env file (SHEET_ID, GOOGLE_CLIENT_EMAIL, GOOGLE_PRIVATE_KEY).
 
 const http = require("http");
-const fs = require("fs");
-const path = require("path");
-const os = require("os");
-const crypto = require("crypto");
 const { exec } = require("child_process");
 
-// ---------- settings ----------
-let cfg = {};
-try { cfg = JSON.parse(fs.readFileSync(path.join(__dirname, "config.json"), "utf8")); } catch {}
-const PORT = Number(process.env.PORT || cfg.port || 3000);
-const PASSWORD = process.env.BOARD_PASSWORD ?? cfg.password ?? "";
-const SHEET_ID = process.env.SHEET_ID || cfg.sheetId || "";
-const KEY_FILE = [process.env.GOOGLE_KEY_FILE, cfg.googleKeyFile, "credentials.json", "google-key.json"]
-  .filter(Boolean).map(f => path.resolve(__dirname, f)).find(f => fs.existsSync(f)) || "";
-const KEY_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || (KEY_FILE ? fs.readFileSync(KEY_FILE, "utf8") : "");
-const TOKEN_FILE = path.join(__dirname, "token.json");
-const SCOPES = ["https://www.googleapis.com/auth/spreadsheets"];
-const HTML_FILE = path.join(__dirname, "public", "index.html");
+const index = require("./api/index.js");
+const login = require("./api/login.js");
+const sheet = require("./api/sheet/[tool].js");   // also loads .env via api/_lib.js
 
-// ---------- storage backends (both speak the same three "sheet" operations) ----------
-let oauth = null;          // set when credentials.json is an OAuth client (Desktop app)
-let oauthReady = false;    // true once token.json exists
-function makeGoogleBackend() {
-  let google;
-  try { ({ google } = require("googleapis")); }
-  catch { throw new Error('Google mode needs the googleapis package. Run "npm install" in this folder first.'); }
-  if (!SHEET_ID) throw new Error("Set sheetId in config.json");
-  let creds;
-  try { creds = JSON.parse(KEY_JSON); } catch { throw new Error((KEY_FILE || "Google key") + " is not valid JSON"); }
-  let auth;
-  if (creds.type === "service_account") {
-    auth = new google.auth.GoogleAuth({ credentials: creds, scopes: SCOPES });
-  } else if (creds.installed || creds.web) {
-    const c = creds.installed || creds.web;
-    oauth = new google.auth.OAuth2(c.client_id, c.client_secret, `http://localhost:${PORT}/oauth2callback`);
-    oauth.on("tokens", t => {
-      let saved = {}; try { saved = JSON.parse(fs.readFileSync(TOKEN_FILE, "utf8")); } catch {}
-      fs.writeFileSync(TOKEN_FILE, JSON.stringify(Object.assign(saved, t), null, 2));
-    });
-    try { oauth.setCredentials(JSON.parse(fs.readFileSync(TOKEN_FILE, "utf8"))); oauthReady = true; } catch {}
-    auth = oauth;
-  } else {
-    throw new Error("Unrecognised Google credentials file — use a Desktop OAuth client or a service-account key");
-  }
-  const sheets = google.sheets({ version: "v4", auth });
-  return {
-    name: "Google Sheet " + SHEET_ID,
-    async get_values({ range }) {
-      const r = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range });
-      return { range: r.data.range, values: r.data.values || [] };
-    },
-    async update_values({ range, values }) {
-      const r = await sheets.spreadsheets.values.update({ spreadsheetId: SHEET_ID, range, valueInputOption: "RAW", requestBody: { values } });
-      return { updatedRange: r.data.updatedRange, updatedRows: r.data.updatedRows, status: "success" };
-    },
-    async update_spreadsheet({ requests }) {
-      await sheets.spreadsheets.batchUpdate({ spreadsheetId: SHEET_ID, requestBody: { requests } });
-      return { status: "success" };
-    },
-  };
-}
+const PORT = Number(process.env.PORT) || 3000;
 
-function makeLocalBackend() {
-  const dir = path.join(__dirname, "data");
-  const file = path.join(dir, "sheet.json");
-  fs.mkdirSync(dir, { recursive: true });
-  let grid = [];
-  try { grid = JSON.parse(fs.readFileSync(file, "utf8")); } catch { grid = []; }
-  const save = () => { fs.writeFileSync(file + ".tmp", JSON.stringify(grid)); fs.renameSync(file + ".tmp", file); };
-  const colNum = s => s.split("").reduce((n, ch) => n * 26 + ch.charCodeAt(0) - 64, 0) - 1;
-  function parse(range) { // "Patients!A5:Q5" -> {r0, c0}
-    const m = /!?([A-Z]+)(\d+)?/.exec(range.split("!").pop());
-    return { c0: m ? colNum(m[1]) : 0, r0: m && m[2] ? Number(m[2]) - 1 : 0 };
-  }
-  const trim = () => {
-    grid = grid.map(r => { r = r.map(v => v ?? ""); while (r.length && r[r.length - 1] === "") r.pop(); return r; });
-    while (grid.length && !grid[grid.length - 1].length) grid.pop();
-  };
-  return {
-    name: "local file " + file,
-    async get_values({ range }) { trim(); return { range, values: grid.map(r => r.slice()) }; },
-    async update_values({ range, values }) {
-      const { r0, c0 } = parse(range);
-      values.forEach((row, i) => {
-        while (grid.length <= r0 + i) grid.push([]);
-        const target = grid[r0 + i];
-        row.forEach((v, j) => { while (target.length < c0 + j) target.push(""); target[c0 + j] = v == null ? "" : String(v); });
-      });
-      trim(); save();
-      return { updatedRange: range, updatedRows: values.length, status: "success" };
-    },
-    async update_spreadsheet({ requests }) {
-      for (const rq of requests || []) {
-        const d = rq.deleteDimension;
-        if (d && d.range && d.range.dimension === "ROWS") grid.splice(d.range.startIndex, d.range.endIndex - d.range.startIndex);
-      }
-      trim(); save();
-      return { status: "success" };
-    },
-  };
-}
-
-let backend, backendError = "";
-try { backend = KEY_JSON ? makeGoogleBackend() : makeLocalBackend(); }
-catch (e) { backendError = e.message; }
-
-// ---------- live updates: tell open boards when something changed ----------
-const clients = new Set();
-function notify() { for (const res of clients) res.write("data: changed\n\n"); }
-
-// ---------- login ----------
-const TOKEN = crypto.createHmac("sha256", "ortho-board:" + PASSWORD).update("session").digest("hex");
-const cookieOf = req => Object.fromEntries((req.headers.cookie || "").split(";").map(c => c.trim().split("=")).filter(a => a[0]));
-const loggedIn = req => !PASSWORD || cookieOf(req).obs === TOKEN;
-const LOGIN_PAGE = msg => `<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1"><title>Ortho Ward Board</title>
-<style>body{font-family:system-ui,sans-serif;background:#F3F6F7;color:#16232A;display:grid;place-items:center;min-height:100vh;margin:0}
-form{background:#fff;border:1px solid #DCE3E6;border-radius:14px;padding:26px;width:min(340px,90vw)}
-h1{font-size:20px;margin:0 0 16px}input{width:100%;box-sizing:border-box;padding:11px;border:1px solid #DCE3E6;border-radius:9px;font-size:16px}
-button{margin-top:12px;width:100%;padding:11px;border:0;border-radius:9px;background:#0D6B6E;color:#fff;font-weight:600;font-size:15px}
-p{color:#B42318;font-size:14px;margin:10px 0 0}</style></head><body>
-<form method="post" action="/login"><h1>Ortho ward board</h1>
-<input type="password" name="password" placeholder="Password" autofocus autocomplete="current-password">
-<button>Open board</button>${msg ? `<p>${msg}</p>` : ""}</form></body></html>`;
-
-const CONNECT_PAGE = msg => `<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1"><title>Connect Google Sheets</title>
-<style>body{font-family:system-ui,sans-serif;background:#F3F6F7;color:#16232A;display:grid;place-items:center;min-height:100vh;margin:0}
-div{background:#fff;border:1px solid #DCE3E6;border-radius:14px;padding:26px;width:min(380px,90vw)}
-h1{font-size:20px;margin:0 0 10px}p{font-size:15px;line-height:1.5;color:#3d4b52}
-a.b{display:block;text-align:center;margin-top:16px;padding:11px;border-radius:9px;background:#0D6B6E;color:#fff;font-weight:600;text-decoration:none}</style></head><body>
-<div><h1>Connect Google Sheets</h1><p>Sign in with the Google account that owns the ward board sheet. You only need to do this once.</p>
-${msg ? `<p>${msg}</p>` : ""}<a class="b" href="/auth">Sign in with Google</a></div></body></html>`;
-
-// ---------- browser shim: gives the page the same Google Sheets calls it uses inside Claude ----------
-const SHIM = `<script>
-(function(){
-  const watchers = new Set();
-  async function call(tool, args){
-    let r;
-    try { r = await fetch("/api/sheet/"+tool, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(args||{})}); }
-    catch(_) { const e=new Error("Server unreachable"); e.code="server_unavailable"; throw e; }
-    if(r.status===401){ location.href="/"; }
-    const j = await r.json().catch(()=>({}));
-    if(!r.ok){ const e=new Error(j.error||"Request failed"); e.code=j.code||"tool_error"; throw e; }
-    return { payload:j };
-  }
-  async function runWatch(w){
-    try { const res = await call(w.tool, w.args); w.handler({type:"data", result:res}); }
-    catch(e){ w.handler({type:"error", error:{code:e.code, message:e.message}}); }
-  }
-  const mcp = {
-    callTool:(server, tool, args)=>call(tool, args),
-    watchTool(server, tool, args, handler, opts){
-      const w={tool, args, handler}; watchers.add(w); runWatch(w);
-      w.timer=setInterval(()=>runWatch(w), Math.max(10000,(opts&&opts.refetchInterval)||30000));
-      return ()=>{ clearInterval(w.timer); watchers.delete(w); };
-    },
-    invalidate: async ()=>{ watchers.forEach(runWatch); }
-  };
-  try { const es=new EventSource("/api/events"); es.onmessage=()=>watchers.forEach(runWatch); } catch(_){}
-  const user = { can: async()=>true, canEdit: async()=>true };
-  window.claude = { use: async n => n==="mcp"?mcp : n==="user"?user : null };
-})();
-</script>`;
-
-// ---------- helpers ----------
-function send(res, code, body, type = "application/json", extra = {}) {
-  res.writeHead(code, Object.assign({ "Content-Type": type, "Cache-Control": "no-store" }, extra));
-  res.end(body);
-}
-function readBody(req, limit = 2e6) {
-  return new Promise((resolve, reject) => {
-    let size = 0; const chunks = [];
-    req.on("data", c => { size += c.length; if (size > limit) { reject(new Error("Request too large")); req.destroy(); } else chunks.push(c); });
-    req.on("end", () => resolve(Buffer.concat(chunks).toString()));
-    req.on("error", reject);
+function readBody(req) {
+  return new Promise(resolve => {
+    let b = ""; req.on("data", c => { b += c; if (b.length > 2e6) req.destroy(); });
+    req.on("end", () => resolve(b));
   });
 }
 
-// ---------- server ----------
-const TOOLS = new Set(["get_values", "update_values", "update_spreadsheet"]);
-const server = http.createServer(async (req, res) => {
+http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://localhost");
+  const raw = await readBody(req);
+  const type = req.headers["content-type"] || "";
+  try {
+    req.body = type.includes("json") ? JSON.parse(raw || "{}")
+             : type.includes("urlencoded") ? Object.fromEntries(new URLSearchParams(raw))
+             : raw;
+  } catch { req.body = {}; }
+  req.query = Object.fromEntries(url.searchParams);
 
-  if (url.pathname === "/login" && req.method === "POST") {
-    const form = new URLSearchParams(await readBody(req, 10000).catch(() => ""));
-    if (PASSWORD && form.get("password") === PASSWORD) {
-      const secure = (req.headers["x-forwarded-proto"] || "") === "https" ? " Secure;" : "";
-      return send(res, 303, "", "text/plain", {
-        "Set-Cookie": `obs=${TOKEN}; Path=/; HttpOnly;${secure} SameSite=Lax; Max-Age=${60 * 60 * 24 * 30}`,
-        Location: "/",
-      });
-    }
-    await new Promise(r => setTimeout(r, 1200)); // slows down password guessing
-    return send(res, 401, LOGIN_PAGE("Wrong password"), "text/html; charset=utf-8");
-  }
-
-  if (!loggedIn(req)) {
-    if (url.pathname.startsWith("/api/")) return send(res, 401, '{"error":"login"}');
-    return send(res, 200, LOGIN_PAGE(""), "text/html; charset=utf-8");
-  }
-
-  if (oauth && url.pathname === "/auth") {
-    return send(res, 302, "", "text/plain", { Location: oauth.generateAuthUrl({ access_type: "offline", prompt: "consent", scope: SCOPES }) });
-  }
-  if (oauth && url.pathname === "/oauth2callback") {
-    try {
-      const { tokens } = await oauth.getToken(url.searchParams.get("code") || "");
-      oauth.setCredentials(tokens);
-      fs.writeFileSync(TOKEN_FILE, JSON.stringify(tokens, null, 2));
-      oauthReady = true;
-      console.log("  Google connected — token saved to token.json");
-      return send(res, 302, "", "text/plain", { Location: "/" });
-    } catch (e) {
-      return send(res, 400, CONNECT_PAGE("Google sign-in failed: " + String(e.message).replace(/</g, "&lt;")), "text/html; charset=utf-8");
-    }
-  }
-  if (oauth && !oauthReady && (url.pathname === "/" || url.pathname === "/index.html")) {
-    const host = (req.headers.host || "").split(":")[0];
-    const msg = host === "localhost" || host === "127.0.0.1" ? "" :
-      `Do this once on the computer running the server, at <b>http://localhost:${PORT}</b>. Google only allows the sign-in there.`;
-    return send(res, 200, CONNECT_PAGE(msg), "text/html; charset=utf-8");
-  }
-
-  if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
-    let html;
-    try { html = fs.readFileSync(HTML_FILE, "utf8"); } catch { return send(res, 500, "public/index.html is missing", "text/plain"); }
-    return send(res, 200, html.replace("</head>", SHIM + "\n</head>"), "text/html; charset=utf-8");
-  }
-
-  if (req.method === "GET" && url.pathname === "/api/events") {
-    res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-store", Connection: "keep-alive", "X-Accel-Buffering": "no" });
-    res.write(": hello\n\n");
-    clients.add(res);
-    const ping = setInterval(() => res.write(": ping\n\n"), 20000);
-    req.on("close", () => { clearInterval(ping); clients.delete(res); });
-    return;
-  }
-
+  if (url.pathname === "/" || url.pathname === "/index.html") return index(req, res);
+  if (url.pathname === "/login") return login(req, res);
   const m = url.pathname.match(/^\/api\/sheet\/([a-z_]+)$/);
-  if (m && req.method === "POST" && TOOLS.has(m[1])) {
-    if (!backend) return send(res, 503, JSON.stringify({ error: backendError, code: "tool_error" }));
-    if (oauth && !oauthReady) return send(res, 503, JSON.stringify({ error: "Google not connected yet", code: "needs_reauth" }));
-    try {
-      const args = JSON.parse((await readBody(req)) || "{}");
-      const out = await backend[m[1]](args);
-      if (m[1] !== "get_values") notify();
-      return send(res, 200, JSON.stringify(out));
-    } catch (e) {
-      const msg = (e && e.message) || "Failed";
-      console.error(m[1], "failed:", msg);
-      const code = /ENOTFOUND|ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket/i.test(msg) ? "server_unavailable" : "tool_error";
-      return send(res, code === "server_unavailable" ? 503 : 400, JSON.stringify({ error: msg, code }));
-    }
-  }
-
-  send(res, 404, "Not found", "text/plain");
-});
-
-server.listen(PORT, "0.0.0.0", () => {
-  const local = `http://localhost:${PORT}`;
-  const lan = Object.values(os.networkInterfaces()).flat()
-    .filter(i => i && i.family === "IPv4" && !i.internal).map(i => `http://${i.address}:${PORT}`);
-  console.log("\n  Ortho Ward Board is running");
-  console.log("  ───────────────────────────");
-  console.log("  This computer:          " + local);
-  lan.forEach(u => console.log("  Phone (same Wi-Fi):     " + u));
-  console.log("  Patients stored in:     " + (backend ? backend.name : "NOT AVAILABLE — " + backendError));
-  if (oauth && !oauthReady) console.log("  Google:                 not connected yet — open " + local + " and sign in once");
-  console.log("  Password:               " + (PASSWORD ? "on" : "OFF — set \"password\" in config.json"));
-  console.log("\n  Keep this window open while you use the board. Press Ctrl+C to stop.\n");
-
-  if (!process.env.SPACE_ID && !process.env.NO_OPEN) {
-    const opener = process.platform === "win32" ? `start "" "${local}"`
-                 : process.platform === "darwin" ? `open "${local}"` : `xdg-open "${local}"`;
+  if (m) { req.query.tool = m[1]; return sheet(req, res); }
+  res.statusCode = 404; res.end("Not found");
+}).listen(PORT, () => {
+  const local = "http://localhost:" + PORT;
+  console.log("\n  Ortho Ward Board running at " + local);
+  console.log("  Google Sheet: " + (process.env.SHEET_ID || "(SHEET_ID missing in .env)"));
+  console.log("  Press Ctrl+C to stop.\n");
+  if (!process.env.NO_OPEN) {
+    const opener = process.platform === "win32" ? `start "" "${local}"` : process.platform === "darwin" ? `open "${local}"` : `xdg-open "${local}"`;
     exec(opener, () => {});
   }
 });

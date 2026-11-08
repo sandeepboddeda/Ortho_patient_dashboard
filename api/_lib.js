@@ -1,5 +1,23 @@
 // Shared helpers for the Vercel functions.
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
+
+// Load .env from the project folder if it was deployed with the code.
+// Values set in Vercel's dashboard take priority over the file.
+(function loadDotEnv() {
+  let text = "";
+  for (const dir of [process.cwd(), path.join(__dirname, "..")]) {
+    try { text = fs.readFileSync(path.join(dir, ".env"), "utf8"); break; } catch {}
+  }
+  for (const line of text.split(/\r?\n/)) {
+    const m = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/.exec(line);
+    if (!m || line.trim().startsWith("#")) continue;
+    let v = m[2].trim();
+    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+    if (process.env[m[1]] === undefined || process.env[m[1]] === "") process.env[m[1]] = v;
+  }
+})();
 
 const PASSWORD = process.env.BOARD_PASSWORD || "";
 const SHEET_ID = process.env.SHEET_ID || "12by6Nuw2Sqjz0J8Mo7BA9pBbNkzdX_p_BRNAgbSPzXE";
@@ -13,10 +31,20 @@ function loggedIn(req) { return !PASSWORD || cookies(req).obs === TOKEN; }
 let client = null;
 function sheetsClient() {
   if (client) return client;
-  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
-  if (!raw) throw Object.assign(new Error("GOOGLE_SERVICE_ACCOUNT_JSON is not set in Vercel"), { code: "tool_error" });
   let creds;
-  try { creds = JSON.parse(raw); } catch { throw Object.assign(new Error("GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON"), { code: "tool_error" }); }
+  const email = process.env.GOOGLE_CLIENT_EMAIL, key = process.env.GOOGLE_PRIVATE_KEY;
+  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+  if (key && key.includes("PASTE-YOUR-KEY-HERE")) {
+    throw Object.assign(new Error("GOOGLE_PRIVATE_KEY in .env still has the placeholder; paste the private_key from your service-account key file"), { code: "tool_error" });
+  }
+  if (email && key) {
+    // .env style: two separate values; the key may have literal \n sequences
+    creds = { type: "service_account", client_email: email.trim(), private_key: key.replace(/\\n/g, "\n") };
+  } else if (raw) {
+    try { creds = JSON.parse(raw); } catch { throw Object.assign(new Error("GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON"), { code: "tool_error" }); }
+  } else {
+    throw Object.assign(new Error("Google key not set: add GOOGLE_CLIENT_EMAIL and GOOGLE_PRIVATE_KEY in Vercel"), { code: "tool_error" });
+  }
   if (creds.type !== "service_account") {
     throw Object.assign(new Error("The key must be a service-account key (it should contain \"type\": \"service_account\")"), { code: "tool_error" });
   }

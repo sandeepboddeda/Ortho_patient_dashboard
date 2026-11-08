@@ -1,9 +1,24 @@
 {
+  "outputDirectory": "public",
   "rewrites": [
-    { "source": "/", "destination": "/api/index" },
-    { "source": "/login", "destination": "/api/login" }
+    {
+      "source": "/",
+      "destination": "/api/index"
+    },
+    {
+      "source": "/login",
+      "destination": "/api/login"
+    }
   ],
   "functions": {
-    "api/index.js": { "includeFiles": "board/**" }
+    "api/index.js": {
+      "includeFiles": "{board/**,.env}"
+    },
+    "api/login.js": {
+      "includeFiles": ".env"
+    },
+    "api/sheet/*.js": {
+      "includeFiles": ".env"
+    }
   }
 }
