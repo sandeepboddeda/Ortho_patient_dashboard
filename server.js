@@ -3,8 +3,10 @@
 //   node server.js
 //
 // Storage:
-//   • Google Sheet mode  — if google-key.json (a service-account key) is next to this file,
-//                          patients are read from and saved to your Google Sheet.
+//   • Google Sheet mode  — if credentials.json (Desktop OAuth client) or google-key.json
+//                          (service-account key) is next to this file, patients are read from
+//                          and saved to your Google Sheet. With credentials.json you sign in once
+//                          in the browser and the login is kept in token.json.
 //   • Local mode         — otherwise, patients are saved in data/sheet.json on this computer.
 //
 // Settings live in config.json (environment variables override them):
@@ -24,17 +26,38 @@ try { cfg = JSON.parse(fs.readFileSync(path.join(__dirname, "config.json"), "utf
 const PORT = Number(process.env.PORT || cfg.port || 3000);
 const PASSWORD = process.env.BOARD_PASSWORD ?? cfg.password ?? "";
 const SHEET_ID = process.env.SHEET_ID || cfg.sheetId || "";
-const KEY_FILE = path.resolve(__dirname, process.env.GOOGLE_KEY_FILE || cfg.googleKeyFile || "google-key.json");
-const KEY_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || (fs.existsSync(KEY_FILE) ? fs.readFileSync(KEY_FILE, "utf8") : "");
+const KEY_FILE = [process.env.GOOGLE_KEY_FILE, cfg.googleKeyFile, "credentials.json", "google-key.json"]
+  .filter(Boolean).map(f => path.resolve(__dirname, f)).find(f => fs.existsSync(f)) || "";
+const KEY_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || (KEY_FILE ? fs.readFileSync(KEY_FILE, "utf8") : "");
+const TOKEN_FILE = path.join(__dirname, "token.json");
+const SCOPES = ["https://www.googleapis.com/auth/spreadsheets"];
 const HTML_FILE = path.join(__dirname, "public", "index.html");
 
 // ---------- storage backends (both speak the same three "sheet" operations) ----------
+let oauth = null;          // set when credentials.json is an OAuth client (Desktop app)
+let oauthReady = false;    // true once token.json exists
 function makeGoogleBackend() {
   let google;
   try { ({ google } = require("googleapis")); }
   catch { throw new Error('Google mode needs the googleapis package. Run "npm install" in this folder first.'); }
   if (!SHEET_ID) throw new Error("Set sheetId in config.json");
-  const auth = new google.auth.GoogleAuth({ credentials: JSON.parse(KEY_JSON), scopes: ["https://www.googleapis.com/auth/spreadsheets"] });
+  let creds;
+  try { creds = JSON.parse(KEY_JSON); } catch { throw new Error((KEY_FILE || "Google key") + " is not valid JSON"); }
+  let auth;
+  if (creds.type === "service_account") {
+    auth = new google.auth.GoogleAuth({ credentials: creds, scopes: SCOPES });
+  } else if (creds.installed || creds.web) {
+    const c = creds.installed || creds.web;
+    oauth = new google.auth.OAuth2(c.client_id, c.client_secret, `http://localhost:${PORT}/oauth2callback`);
+    oauth.on("tokens", t => {
+      let saved = {}; try { saved = JSON.parse(fs.readFileSync(TOKEN_FILE, "utf8")); } catch {}
+      fs.writeFileSync(TOKEN_FILE, JSON.stringify(Object.assign(saved, t), null, 2));
+    });
+    try { oauth.setCredentials(JSON.parse(fs.readFileSync(TOKEN_FILE, "utf8"))); oauthReady = true; } catch {}
+    auth = oauth;
+  } else {
+    throw new Error("Unrecognised Google credentials file — use a Desktop OAuth client or a service-account key");
+  }
   const sheets = google.sheets({ version: "v4", auth });
   return {
     name: "Google Sheet " + SHEET_ID,
@@ -116,6 +139,15 @@ p{color:#B42318;font-size:14px;margin:10px 0 0}</style></head><body>
 <input type="password" name="password" placeholder="Password" autofocus autocomplete="current-password">
 <button>Open board</button>${msg ? `<p>${msg}</p>` : ""}</form></body></html>`;
 
+const CONNECT_PAGE = msg => `<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Connect Google Sheets</title>
+<style>body{font-family:system-ui,sans-serif;background:#F3F6F7;color:#16232A;display:grid;place-items:center;min-height:100vh;margin:0}
+div{background:#fff;border:1px solid #DCE3E6;border-radius:14px;padding:26px;width:min(380px,90vw)}
+h1{font-size:20px;margin:0 0 10px}p{font-size:15px;line-height:1.5;color:#3d4b52}
+a.b{display:block;text-align:center;margin-top:16px;padding:11px;border-radius:9px;background:#0D6B6E;color:#fff;font-weight:600;text-decoration:none}</style></head><body>
+<div><h1>Connect Google Sheets</h1><p>Sign in with the Google account that owns the ward board sheet. You only need to do this once.</p>
+${msg ? `<p>${msg}</p>` : ""}<a class="b" href="/auth">Sign in with Google</a></div></body></html>`;
+
 // ---------- browser shim: gives the page the same Google Sheets calls it uses inside Claude ----------
 const SHIM = `<script>
 (function(){
@@ -185,6 +217,28 @@ const server = http.createServer(async (req, res) => {
     return send(res, 200, LOGIN_PAGE(""), "text/html; charset=utf-8");
   }
 
+  if (oauth && url.pathname === "/auth") {
+    return send(res, 302, "", "text/plain", { Location: oauth.generateAuthUrl({ access_type: "offline", prompt: "consent", scope: SCOPES }) });
+  }
+  if (oauth && url.pathname === "/oauth2callback") {
+    try {
+      const { tokens } = await oauth.getToken(url.searchParams.get("code") || "");
+      oauth.setCredentials(tokens);
+      fs.writeFileSync(TOKEN_FILE, JSON.stringify(tokens, null, 2));
+      oauthReady = true;
+      console.log("  Google connected — token saved to token.json");
+      return send(res, 302, "", "text/plain", { Location: "/" });
+    } catch (e) {
+      return send(res, 400, CONNECT_PAGE("Google sign-in failed: " + String(e.message).replace(/</g, "&lt;")), "text/html; charset=utf-8");
+    }
+  }
+  if (oauth && !oauthReady && (url.pathname === "/" || url.pathname === "/index.html")) {
+    const host = (req.headers.host || "").split(":")[0];
+    const msg = host === "localhost" || host === "127.0.0.1" ? "" :
+      `Do this once on the computer running the server, at <b>http://localhost:${PORT}</b>. Google only allows the sign-in there.`;
+    return send(res, 200, CONNECT_PAGE(msg), "text/html; charset=utf-8");
+  }
+
   if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
     let html;
     try { html = fs.readFileSync(HTML_FILE, "utf8"); } catch { return send(res, 500, "public/index.html is missing", "text/plain"); }
@@ -203,6 +257,7 @@ const server = http.createServer(async (req, res) => {
   const m = url.pathname.match(/^\/api\/sheet\/([a-z_]+)$/);
   if (m && req.method === "POST" && TOOLS.has(m[1])) {
     if (!backend) return send(res, 503, JSON.stringify({ error: backendError, code: "tool_error" }));
+    if (oauth && !oauthReady) return send(res, 503, JSON.stringify({ error: "Google not connected yet", code: "needs_reauth" }));
     try {
       const args = JSON.parse((await readBody(req)) || "{}");
       const out = await backend[m[1]](args);
@@ -228,6 +283,7 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log("  This computer:          " + local);
   lan.forEach(u => console.log("  Phone (same Wi-Fi):     " + u));
   console.log("  Patients stored in:     " + (backend ? backend.name : "NOT AVAILABLE — " + backendError));
+  if (oauth && !oauthReady) console.log("  Google:                 not connected yet — open " + local + " and sign in once");
   console.log("  Password:               " + (PASSWORD ? "on" : "OFF — set \"password\" in config.json"));
   console.log("\n  Keep this window open while you use the board. Press Ctrl+C to stop.\n");
 
